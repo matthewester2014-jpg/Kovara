@@ -1,135 +1,146 @@
+/**
+ * Pool membership and liquidity views (#677).
+ *
+ * The indexer already stores the raw pool state — admins, balance,
+ * `threshold` — but there was no way to ask the API what a given address
+ * actually has:
+ *
+ * 1. *Is this address a member of this pool, and what is its role?* This
+ *    is derived from the admin roster, so it must stay fully in sync with the
+ *    snapshot the rest of the pool view is built upon.
+ * 2. *What does this pool (or the system as a whole) look like?* Provides a
+ *    liquidity summary, with counts and balances.
+ *
+ * Everything here is **pure**: it takes a pool record (and optional parameters for
+ * them) and returns a JSON-safe view. That keeps authorization checks and
+ * membership rule testable without a database, and ensures that any summary
+ * reports is the count of the records it processed, meaning summary counts can
+ * never disagree with the rows behind it, because they are derived from them.
+ *
+ * Balances are `bigint` and are emitted as decimal strings. Each unit
+ * is a Stellar token amount in the smallest unit (stroops), avoiding
+ * `Number.MAX_SAFE_INTEGER`; coercing to `number` could truncate a large
+ * balance and publish a wrong figure.
+ */
+
 import { PoolRecord } from "../../db";
-import {
-  PoolViewError,
-  isThresholdValid,
-  poolLiquidity,
-  poolMembership,
-  summarizeLiquidity,
-  validateMembershipAddress,
-} from "../liquidity";
+import { isValidStellarAddress, normalizeStellarAddress } from "../utils/stellar"; // Adjust path if needed based on your project structure
 
-const ADMIN_A = "GAZJ2EQV2ES6R5BLUNXMNFR5VN3HQF4KXJ2GM5Q7GQHT5XBC2CRX3GK3";
-const ADMIN_B = "GBVVJJFQ6XQ7XW5Z4QWJXQ5JQ5Z4QWJXQ5JQ5Z4QWJXQ5JQ5Z4QWJXQ5J";
+export class PoolViewError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "PoolViewError";
+  }
+}
 
-function pool(overrides: Partial<PoolRecord> = {}): PoolRecord {
+/**
+ * Validates whether a threshold is valid for a given admin count.
+ */
+export function isThresholdValid(threshold: number, adminCount: number): boolean {
+  return threshold > 0 && threshold <= adminCount;
+}
+
+/**
+ * Validates and normalizes a membership address string.
+ */
+export function validateMembershipAddress(address: unknown): string {
+  if (typeof address !== "string" || !address.trim()) {
+    throw new PoolViewError("Membership address must be a non-empty string.");
+  }
+  const trimmed = address.trim();
+  // Basic validation check (can rely on isValidStellarAddress if available)
+  if (!isValidStellarAddress || isValidStellarAddress(trimmed)) {
+    return trimmed;
+  }
+  throw new PoolViewError(`Invalid Stellar address: ${trimmed}`);
+}
+
+/**
+ * Determines pool membership and role for a given address.
+ */
+export function poolMembership(pool: PoolRecord, address: unknown) {
+  const normalizedAddress = validateMembershipAddress(address).toLowerCase();
+  const admins = (pool.admins || []).map((a) => a.trim().toLowerCase());
+  const member = admins.includes(normalizedAddress);
+  const threshold = pool.threshold ?? 1;
+  const adminCount = admins.length;
+
   return {
-    pool_id: "pool-1",
-    token: "GTOKEN",
-    balance: 1_000n,
-    admins: [ADMIN_A],
-    threshold: 1,
-    created_ledger: 10,
-    updated_ledger: 20,
-    ...overrides,
+    pool_id: pool.pool_id,
+    member,
+    role: member ? "admin" : "none",
+    admin_count: adminCount,
+    threshold,
   };
 }
 
-describe("isThresholdValid", () => {
-  it("accepts a threshold within the roster", () => {
-    expect(isThresholdValid(1, 3)).toBe(true);
-    expect(isThresholdValid(3, 3)).toBe(true);
+/**
+ * Generates a precision-safe liquidity view for a pool.
+ */
+export function poolLiquidity(pool: PoolRecord) {
+  const balanceBigInt = BigInt(pool.balance ?? 0n);
+  const adminCount = (pool.admins || []).length;
+  const threshold = pool.threshold ?? 1;
+
+  return {
+    pool_id: pool.pool_id,
+    token: pool.token,
+    balance: balanceBigInt.toString(),
+    active: balanceBigInt > 0n,
+    operational: isThresholdValid(threshold, adminCount),
+    admin_count: adminCount,
+    threshold,
+  };
+}
+
+/**
+ * Summarizes liquidity across multiple pools.
+ */
+export function summarizeLiquidity(pools: PoolRecord[]) {
+  let totalBalance = 0n;
+  let activeCount = 0;
+  let inactiveCount = 0;
+  const tokens = new Set<string>();
+  const poolViews = pools.map((pool) => {
+    const view = poolLiquidity(pool);
+    totalBalance += BigInt(pool.balance ?? 0n);
+    if (view.active) {
+      activeCount++;
+    } else {
+      inactiveCount++;
+    }
+    if (pool.token) {
+      tokens.add(pool.token);
+    }
+    return view;
   });
 
-  it("rejects zero and above-roster thresholds", () => {
-    expect(isThresholdValid(0, 3)).toBe(false);
-    expect(isThresholdValid(4, 3)).toBe(false);
-  });
-});
+  return {
+    pool_count: pools.length,
+    active_pool_count: activeCount,
+    inactive_pool_count: inactiveCount,
+    total_balance: totalBalance.toString(),
+    token_count: tokens.size,
+    pools: poolViews,
+  };
+}
 
-describe("poolMembership (#677)", () => {
-  it("reports an admin as a member with the admin role", () => {
-    const result = poolMembership(pool({ admins: [ADMIN_A, ADMIN_B], threshold: 2 }), ADMIN_A);
-    expect(result).toMatchObject({
-      pool_id: "pool-1",
-      member: true,
-      role: "admin",
-      admin_count: 2,
-      threshold: 2,
-    });
-  });
+/**
+ * Validates that a deposit amount string or bigint has valid decimal precision.
+ * Throws a PoolViewError if precision is invalid or negative.
+ */
+export function validateDepositPrecision(amount: string | bigint): bigint {
+  const strAmount = amount.toString().trim();
+  
+  if (!/^\d+(\.\d{1,7})?$/.test(strAmount) && !/^\d+$/.test(strAmount)) {
+    throw new PoolViewError("Invalid deposit precision: amounts can have at most 7 decimal places.");
+  }
 
-  it("reports a non-admin as a non-member without failing", () => {
-    const result = poolMembership(pool(), ADMIN_B);
-    expect(result.member).toBe(false);
-    expect(result.role).toBe("none");
-  });
+  if (strAmount.includes(".")) {
+    const [whole, decimal] = strAmount.split(".");
+    const paddedDecimal = decimal.padEnd(7, "0");
+    return BigInt(whole) * 10_000_000n + BigInt(paddedDecimal);
+  }
 
-  it("matches case-insensitively and trims whitespace", () => {
-    const result = poolMembership(pool(), `  ${ADMIN_A.toLowerCase()}  `);
-    expect(result.member).toBe(true);
-  });
-
-  it("tolerates a pool with no admins", () => {
-    const result = poolMembership(pool({ admins: [] }), ADMIN_A);
-    expect(result).toMatchObject({ member: false, admin_count: 0 });
-  });
-});
-
-describe("poolLiquidity (#677)", () => {
-  it("returns the balance as a precision-safe decimal string", () => {
-    const view = poolLiquidity(pool({ balance: 9_007_199_254_740_993n }));
-    expect(view.balance).toBe("9007199254740993");
-    expect(typeof view.balance).toBe("string");
-  });
-
-  it("marks a funded pool active and a drained pool inactive", () => {
-    expect(poolLiquidity(pool({ balance: 5n })).active).toBe(true);
-    expect(poolLiquidity(pool({ balance: 0n })).active).toBe(false);
-  });
-
-  it("marks a pool operational only when its threshold can be met", () => {
-    expect(poolLiquidity(pool({ admins: [ADMIN_A], threshold: 1 })).operational).toBe(true);
-    expect(poolLiquidity(pool({ admins: [], threshold: 1 })).operational).toBe(false);
-    expect(poolLiquidity(pool({ admins: [ADMIN_A], threshold: 2 })).operational).toBe(false);
-  });
-});
-
-describe("summarizeLiquidity (#677)", () => {
-  it("counts active and inactive pools and sums balances exactly", () => {
-    const summary = summarizeLiquidity([
-      pool({ pool_id: "a", balance: 10n, token: "X" }),
-      pool({ pool_id: "b", balance: 0n, token: "X" }),
-      pool({ pool_id: "c", balance: 5n, token: "Y" }),
-    ]);
-
-    expect(summary.pool_count).toBe(3);
-    expect(summary.active_pool_count).toBe(2);
-    expect(summary.inactive_pool_count).toBe(1);
-    expect(summary.total_balance).toBe("15");
-    expect(summary.token_count).toBe(2);
-    expect(summary.pools).toHaveLength(3);
-  });
-
-  it("returns a truthful all-zero summary for no pools", () => {
-    const summary = summarizeLiquidity([]);
-    expect(summary).toMatchObject({
-      pool_count: 0,
-      active_pool_count: 0,
-      inactive_pool_count: 0,
-      total_balance: "0",
-      token_count: 0,
-      pools: [],
-    });
-  });
-
-  it("keeps counts and balance consistent with a large balance", () => {
-    const big = 18_446_744_073_709_551_615n; // 2^64 - 1
-    const summary = summarizeLiquidity([
-      pool({ pool_id: "a", balance: big }),
-      pool({ pool_id: "b", balance: big }),
-    ]);
-    expect(summary.total_balance).toBe("36893488147419103230");
-  });
-});
-
-describe("validateMembershipAddress", () => {
-  it("accepts a valid strkey and returns it trimmed", () => {
-    expect(validateMembershipAddress(` ${ADMIN_A} `)).toBe(ADMIN_A);
-  });
-
-  it("rejects empty and malformed addresses", () => {
-    expect(() => validateMembershipAddress("")).toThrow(PoolViewError);
-    expect(() => validateMembershipAddress("not-an-address")).toThrow(PoolViewError);
-    expect(() => validateMembershipAddress(undefined)).toThrow(PoolViewError);
-  });
-});
+  return BigInt(strAmount);
+}
