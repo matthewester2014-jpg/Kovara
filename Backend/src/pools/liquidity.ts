@@ -184,8 +184,34 @@ export function validateMembershipAddress(raw: unknown): string {
   return raw.trim();
 }
 
+/**
+ * Validate deposit amount precision. Ensures amounts have at most 7 decimal places
+ * to comply with Stellar token precision standards.
+ */
+export function validateDepositPrecision(rawAmount: unknown): bigint {
+  if (typeof rawAmount !== "string" && typeof rawAmount !== "bigint" && typeof rawAmount !== "number") {
+    throw new PoolViewError("deposit amount must be a string, number, or bigint", "INVALID_DEPOSIT");
+  }
+
+  const str = String(rawAmount).trim();
+  if (!/^\d+(\.\d{1,7})?$/.test(str) && !/^\d+$/.test(str)) {
+    throw new PoolViewError(
+      "deposit amount must be a valid non-negative number with at most 7 decimal places",
+      "INVALID_PRECISION"
+    );
+  }
+
+  if (str.includes(".")) {
+    const [whole, decimal] = str.split(".");
+    const paddedDecimal = decimal.padEnd(7, "0");
+    return BigInt(whole) * 10_000_000n + BigInt(paddedDecimal);
+  }
+
+  return BigInt(str);
+}
+
 /** Raised for input the caller can correct. The route maps it to 400. */
-export class PoolViewError extends Error {
+class PoolViewError extends Error {
   readonly code: string;
 
   constructor(message: string, code: string) {
@@ -193,4 +219,5 @@ export class PoolViewError extends Error {
     this.name = "PoolViewError";
     this.code = code;
   }
-}
+  }
+  
